@@ -30,10 +30,6 @@ static YOMICHAN_GLOBAL: LazyLock<Arc<RwLock<Option<Yomichan>>>> = LazyLock::new(
     }
 });
 
-struct ProairGame;
-#[gdextension]
-unsafe impl ExtensionLibrary for ProairGame {}
-
 // --- 2. SCREEN 1: SEARCH ---
 #[derive(GodotClass)]
 #[class(base=Control)]
@@ -58,8 +54,8 @@ impl IControl for SearchScreen {
 
     fn ready(&mut self) {
         // Auto-connect text_submitted signal
+        let callback = self.base().callable("perform_search");
         if let Some(input) = &mut self.input {
-            let callback = self.base().callable("perform_search");
             if !input.is_connected("text_submitted", &callback) {
                 input.connect("text_submitted", &callback);
             }
@@ -125,10 +121,10 @@ impl IControl for DictionariesScreen {
         self.refresh_status();
 
         // Connect the file dialog "dir_selected" signal
+        let on_dir_selected = self.base().callable("on_file_dialog_selected");
         if let Some(fd) = &mut self.file_dialog {
-            let on_dir_selected = self.base().callable("on_file_dialog_selected");
             if !fd.is_connected("dir_selected", &on_dir_selected) {
-                 fd.connect("dir_selected", &on_dir_selected);
+                fd.connect("dir_selected", &on_dir_selected);
             }
         }
     }
@@ -185,7 +181,7 @@ impl DictionariesScreen {
                 Err(e) => godot_warn!("Import Failed: {}", e),
             }
         }
-        
+
         drop(lock); // Release lock before UI update
         self.refresh_status();
     }

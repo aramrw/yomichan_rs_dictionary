@@ -1,15 +1,17 @@
+mod extensions;
+mod scripts;
 use godot::classes::{
     Control, FileDialog, IControl, Label, LineEdit, OptionButton, RichTextLabel, VBoxContainer,
 };
 use godot::prelude::*;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, RwLock};
+use yomichan_rs::Ptr;
 use yomichan_rs::Yomichan;
 
 // --- 1. GLOBAL STATE MANAGER ---
-// We use Arc<RwLock> so we can safely share the dictionary across threads/screens.
-// We use Option so the app can start even if Yomichan fails to load initially.
-static YOMICHAN_GLOBAL: LazyLock<Arc<RwLock<Option<Yomichan>>>> = LazyLock::new(|| {
+// Option so the app can start even if Yomichan fails to load initially.
+static YOMICHAN_GLOBAL: LazyLock<Ptr<Option<Yomichan>>> = LazyLock::new(|| {
     let user_path = godot::classes::Os::singleton()
         .get_user_data_dir()
         .to_string();
@@ -22,18 +24,18 @@ static YOMICHAN_GLOBAL: LazyLock<Arc<RwLock<Option<Yomichan>>>> = LazyLock::new(
             // Default config
             let _ = y.set_language("es");
             let _ = y.update_options();
-            Arc::new(RwLock::new(Some(y)))
+            Ptr::from(Some(y))
         }
         Err(e) => {
-            godot_warn!("Yomichan init failed (ignore if first run): {}", e);
-            Arc::new(RwLock::new(None))
+            godot_warn!("Yomichan init failed {e}");
+            Ptr::from(None)
         }
     }
 });
 
-struct ProairGame;
+struct YomichanRustDictionary;
 #[gdextension]
-unsafe impl ExtensionLibrary for ProairGame {}
+unsafe impl ExtensionLibrary for YomichanRustDictionary {}
 
 // --- 2. SCREEN 1: SEARCH ---
 #[derive(GodotClass)]
@@ -99,87 +101,6 @@ impl SearchScreen {
 }
 
 // --- 3. SCREEN 2: DICTIONARIES ---
-#[derive(GodotClass)]
-#[class(base=Control)]
-pub struct DictionariesScreen {
-    #[export]
-    status_label: Option<Gd<Label>>,
-    #[export]
-    import_path_input: Option<Gd<LineEdit>>,
-    #[base]
-    base: Base<Control>,
-}
-
-#[godot_api]
-impl IControl for DictionariesScreen {
-    fn init(base: Base<Control>) -> Self {
-        Self {
-            status_label: None,
-            import_path_input: None,
-            base,
-        }
-    }
-
-    fn ready(&mut self) {
-        self.refresh_status();
-    }
-}
-
-#[godot_api]
-impl DictionariesScreen {
-    #[func]
-    fn refresh_status(&mut self) {
-        let Some(label) = &mut self.status_label else {
-            return;
-        };
-
-        let lock = YOMICHAN_GLOBAL.read().unwrap();
-        if let Some(y) = lock.as_ref() {
-            let count = y.dictionary_summaries().map(|s| s.len()).unwrap_or(0);
-            label.set_text(&format!("Status: Active\nDictionaries Loaded: {}", count));
-        } else {
-            label.set_text("Status: Not Initialized (Files missing?)");
-        }
-    }
-
-    #[func]
-    fn on_import_pressed(&mut self) {
-        let path_str = self
-            .import_path_input
-            .as_ref()
-            .map(|i| i.get_text().to_string())
-            .unwrap_or_default();
-
-        if path_str.is_empty() {
-            godot_print!("No path provided");
-            return;
-        }
-
-        // This requires write access to the global state
-        let mut lock = YOMICHAN_GLOBAL.write().unwrap();
-
-        // If yomichan is None, try to re-init it first or create new
-        if lock.is_none() {
-            let user_path = PathBuf::from(
-                godot::classes::Os::singleton()
-                    .get_user_data_dir()
-                    .to_string(),
-            );
-            *lock = Yomichan::new(user_path).ok();
-        }
-
-        if let Some(y) = lock.as_mut() {
-            match y.import_dictionaries(&[&path_str]) {
-                Ok(_) => godot_print!("Import Success!"),
-                Err(e) => godot_warn!("Import Failed: {}", e),
-            }
-        }
-
-        // Drop lock before refreshing UI to avoid deadlocks
-        drop(lock);
-        self.refresh_status();
-    }
-}
 
 // --- 4. SCREEN 3: SETTINGS ---
 #[derive(GodotClass)]

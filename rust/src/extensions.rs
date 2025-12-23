@@ -6,6 +6,4 @@ trait InternalExtGodot {
     }
 }
 
-impl<T: godot::prelude::GodotClass> InternalExtGodot for Gd<T> {
-
-}
+impl<T: godot::prelude::GodotClass> InternalExtGodot for Gd<T> {}
