@@ -42,7 +42,7 @@ impl DictionariesScreen {
             return;
         };
 
-        let lock = YOMICHAN_GLOBAL.read().unwrap();
+        let lock = YOMICHAN_GLOBAL.read();
         if let Some(y) = lock.as_ref() {
             let count = y.dictionary_summaries().map(|s| s.len()).unwrap_or(0);
             label.set_text(&format!("Status: Active\nDictionaries Loaded: {}", count));
@@ -65,27 +65,29 @@ impl DictionariesScreen {
         }
 
         // This requires write access to the global state
-        let mut lock = YOMICHAN_GLOBAL.write().unwrap();
+        let mut ycd = YOMICHAN_GLOBAL.write();
 
         // If yomichan is None, try to re-init it first or create new
-        if lock.is_none() {
+        if ycd.is_none() {
             let user_path = PathBuf::from(
                 godot::classes::Os::singleton()
                     .get_user_data_dir()
                     .to_string(),
             );
-            *lock = Yomichan::new(user_path).ok();
+            *ycd = Yomichan::new(user_path).ok();
         }
 
-        if let Some(y) = lock.as_mut() {
-            match y.import_dictionaries(&[&path_str]) {
-                Ok(_) => godot_print!("Import Success!"),
-                Err(e) => godot_warn!("Import Failed: {}", e),
-            }
+        let Some(ycd) = ycd.take() else {
+            return;
+        };
+
+        match ycd.import_dictionaries(&[&path_str]) {
+            Ok(_) => godot_print!("Import Success!"),
+            Err(e) => godot_warn!("Import Failed: {}", e),
         }
 
         // Drop lock before refreshing UI to avoid deadlocks
-        drop(lock);
+        drop(ycd);
         self.refresh_status();
     }
 }

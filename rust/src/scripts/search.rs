@@ -68,6 +68,7 @@ impl SearchScreen {
     #[func]
     fn perform_search(&mut self, text: GString) {
         let Some(container) = &mut self.results_container else {
+            godot_error!("results_containers doesn't exist!");
             return;
         };
 
@@ -84,7 +85,7 @@ impl SearchScreen {
 
             // Render results
             let mut label = RichTextLabel::new_alloc();
-            label.set_text(&format!("{:#?}", results)); // Debug view
+            label.set_text(&format!("{:#?}", results));
             label.set_fit_content(true);
             container.add_child(&label);
         } else {
