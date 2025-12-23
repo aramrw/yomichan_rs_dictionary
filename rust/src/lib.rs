@@ -1,127 +1,219 @@
-use godot::classes::{Control, IControl, InputEvent, Label, LineEdit, Os, VBoxContainer};
+use godot::classes::{
+    Control, FileDialog, IControl, Label, LineEdit, OptionButton, RichTextLabel, VBoxContainer,
+};
 use godot::prelude::*;
 use std::path::PathBuf;
-use std::sync::{Arc, LazyLock, RwLock}; // Use Arc<RwLock> for statics
+use std::sync::{Arc, LazyLock, RwLock};
 use yomichan_rs::Yomichan;
 
-struct ProairGame;
+// --- 1. GLOBAL STATE MANAGER ---
+// We use Arc<RwLock> so we can safely share the dictionary across threads/screens.
+// We use Option so the app can start even if Yomichan fails to load initially.
+static YOMICHAN_GLOBAL: LazyLock<Arc<RwLock<Option<Yomichan>>>> = LazyLock::new(|| {
+    let user_path = godot::classes::Os::singleton()
+        .get_user_data_dir()
+        .to_string();
+    let path = PathBuf::from(user_path);
 
-#[gdextension]
-unsafe impl ExtensionLibrary for ProairGame {}
+    godot_print!("Initializing Yomichan at: {:?}", path);
 
-// We wrap in Option so the game doesn't crash if files are missing
-static YCD: LazyLock<Arc<RwLock<Option<Yomichan>>>> = LazyLock::new(|| {
-    // 1. GET GODOT USER PATH (Works on Android/iOS/PC)
-    let user_dir = Os::singleton().get_user_data_dir().to_string();
-    let path = PathBuf::from(user_dir);
-
-    godot_print!("Attempting to load dictionary from: {:?}", path);
-
-    // 2. SAFETY CHECK (No unwrap)
     match Yomichan::new(path.clone()) {
         Ok(mut y) => {
-            // Log errors instead of crashing if settings fail
-            if let Err(e) = y.set_language("es") {
-                godot_warn!("Failed to set lang: {}", e);
-            }
-            if let Err(e) = y.update_options() {
-                godot_warn!("Failed to update options: {}", e);
-            }
+            // Default config
+            let _ = y.set_language("es");
+            let _ = y.update_options();
             Arc::new(RwLock::new(Some(y)))
         }
         Err(e) => {
-            godot_error!(
-                "Failed to initialize Yomichan: {}. Ensure files are in {:?}",
-                e,
-                path
-            );
+            godot_warn!("Yomichan init failed (ignore if first run): {}", e);
             Arc::new(RwLock::new(None))
         }
     }
 });
 
+struct ProairGame;
+#[gdextension]
+unsafe impl ExtensionLibrary for ProairGame {}
+
+// --- 2. SCREEN 1: SEARCH ---
 #[derive(GodotClass)]
-#[class(base=Control)] // Removed init, usually better to use default for Control
-pub struct SearchState {
+#[class(base=Control)]
+pub struct SearchScreen {
     #[export]
-    search_input: Option<Gd<LineEdit>>,
+    input: Option<Gd<LineEdit>>,
     #[export]
-    search_results: Option<Gd<VBoxContainer>>,
+    results_container: Option<Gd<VBoxContainer>>, // Use a VBox inside a ScrollContainer
     #[base]
     base: Base<Control>,
 }
 
 #[godot_api]
-impl IControl for SearchState {
+impl IControl for SearchScreen {
     fn init(base: Base<Control>) -> Self {
-        let mut search_input = LineEdit::new_alloc();
-        search_input.set_text("testing");
         Self {
-            search_input: Some(search_input),
-            search_results: None,
+            input: None,
+            results_container: None,
             base,
         }
     }
 
     fn ready(&mut self) {
-        let on_submit = self.base().callable("search");
-
-        if let Some(input) = &mut self.search_input {
-            input.connect("text_submitted", &on_submit);
-            input.grab_focus();
-        } else {
-            godot_error!("Search Input is not linked in the Godot Editor!");
-        }
-    }
-
-    fn unhandled_input(&mut self, event: Gd<InputEvent>) {
-        if event.is_action_pressed("ui_cancel") {
-            if let Some(input) = &mut self.search_input {
-                input.grab_focus();
-                input.select_all();
-            }
+        // Auto-connect the text_submitted signal if input is assigned
+        let callback = self.base().callable("perform_search");
+        if let Some(input) = &mut self.input {
+            input.connect("text_submitted", &callback);
         }
     }
 }
 
 #[godot_api]
-impl SearchState {
+impl SearchScreen {
     #[func]
-    fn search(&mut self, text: GString) {
-        godot_error!("its all corrupted!!! game over!!!!");
-        let Some(results) = &mut self.search_results else {
-            godot_error!("search_results container is missing!");
+    fn perform_search(&mut self, text: GString) {
+        let Some(container) = &mut self.results_container else {
             return;
         };
 
-        // 3. CLEAR PREVIOUS RESULTS
-        for mut child in results.get_children().iter_shared() {
+        // Clear previous results
+        for mut child in container.get_children().iter_shared() {
             child.queue_free();
         }
 
-        let mut label_query = Label::new_alloc();
-        let mut label_def = Label::new_alloc();
-
-        label_query.set_text(&format!("Query: '{}'", text));
-        results.add_child(&label_query);
-
-        // 4. PERFORM SAFE SEARCH
-        let mut lock = YCD.write().unwrap();
+        // Access Global State
+        let mut lock = YOMICHAN_GLOBAL.write().unwrap();
 
         if let Some(yomichan) = lock.as_mut() {
-            let search_res = yomichan.search(&text.to_string());
+            let results = yomichan.search(&text.to_string());
 
-            // Format the output specifically for reading
-            let output_text = format!("{:#?}", search_res);
-            label_def.set_text(&output_text);
-            label_def.set_autowrap_mode(godot::classes::text_server::AutowrapMode::WORD_SMART);
+            // Render results (Simplified for now)
+            let mut label = RichTextLabel::new_alloc();
+            label.set_text(&format!("{:#?}", results)); // Pretty print debug for now
+            label.set_fit_content(true); // Auto-expand height
+            container.add_child(&label);
         } else {
-            label_def.set_text(
-                "Dictionary not found.\nPlease copy dictionary files to the user data folder.",
-            );
+            let mut label = Label::new_alloc();
+            label.set_text("Dictionary backend not loaded. Check 'Dictionaries' tab.");
+            container.add_child(&label);
+        }
+    }
+}
+
+// --- 3. SCREEN 2: DICTIONARIES ---
+#[derive(GodotClass)]
+#[class(base=Control)]
+pub struct DictionariesScreen {
+    #[export]
+    status_label: Option<Gd<Label>>,
+    #[export]
+    import_path_input: Option<Gd<LineEdit>>,
+    #[base]
+    base: Base<Control>,
+}
+
+#[godot_api]
+impl IControl for DictionariesScreen {
+    fn init(base: Base<Control>) -> Self {
+        Self {
+            status_label: None,
+            import_path_input: None,
+            base,
+        }
+    }
+
+    fn ready(&mut self) {
+        self.refresh_status();
+    }
+}
+
+#[godot_api]
+impl DictionariesScreen {
+    #[func]
+    fn refresh_status(&mut self) {
+        let Some(label) = &mut self.status_label else {
+            return;
+        };
+
+        let lock = YOMICHAN_GLOBAL.read().unwrap();
+        if let Some(y) = lock.as_ref() {
+            let count = y.dictionary_summaries().map(|s| s.len()).unwrap_or(0);
+            label.set_text(&format!("Status: Active\nDictionaries Loaded: {}", count));
+        } else {
+            label.set_text("Status: Not Initialized (Files missing?)");
+        }
+    }
+
+    #[func]
+    fn on_import_pressed(&mut self) {
+        let path_str = self
+            .import_path_input
+            .as_ref()
+            .map(|i| i.get_text().to_string())
+            .unwrap_or_default();
+
+        if path_str.is_empty() {
+            godot_print!("No path provided");
+            return;
         }
 
-        // 5. ACTUALLY ADD THE DEFINITION TO TREE
-        results.add_child(&label_def);
+        // This requires write access to the global state
+        let mut lock = YOMICHAN_GLOBAL.write().unwrap();
+
+        // If yomichan is None, try to re-init it first or create new
+        if lock.is_none() {
+            let user_path = PathBuf::from(
+                godot::classes::Os::singleton()
+                    .get_user_data_dir()
+                    .to_string(),
+            );
+            *lock = Yomichan::new(user_path).ok();
+        }
+
+        if let Some(y) = lock.as_mut() {
+            match y.import_dictionaries(&[&path_str]) {
+                Ok(_) => godot_print!("Import Success!"),
+                Err(e) => godot_warn!("Import Failed: {}", e),
+            }
+        }
+
+        // Drop lock before refreshing UI to avoid deadlocks
+        drop(lock);
+        self.refresh_status();
+    }
+}
+
+// --- 4. SCREEN 3: SETTINGS ---
+#[derive(GodotClass)]
+#[class(base=Control)]
+pub struct SettingsScreen {
+    #[base]
+    base: Base<Control>,
+}
+
+#[godot_api]
+impl IControl for SettingsScreen {
+    fn init(base: Base<Control>) -> Self {
+        Self { base }
+    }
+}
+
+#[godot_api]
+impl SettingsScreen {
+    #[func]
+    fn set_lang_es(&mut self) {
+        self.change_lang("es");
+    }
+
+    #[func]
+    fn set_lang_en(&mut self) {
+        self.change_lang("en");
+    }
+
+    fn change_lang(&self, lang_code: &str) {
+        let mut lock = YOMICHAN_GLOBAL.write().unwrap();
+        if let Some(y) = lock.as_mut() {
+            let _ = y.set_language(lang_code);
+            let _ = y.update_options();
+            godot_print!("Language changed to: {}", lang_code);
+        }
     }
 }

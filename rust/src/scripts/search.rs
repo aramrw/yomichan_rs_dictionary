@@ -1,89 +1,229 @@
-use std::path::PathBuf;
-use std::sync::LazyLock;
-
-// dictionary_ui.rs (Modified)
-use better_default::Default;
-use godot::classes::*;
+use godot::classes::{
+    Control, FileDialog, IControl, Label, LineEdit, RichTextLabel, VBoxContainer,
+};
 use godot::prelude::*;
-
-use dirs::data_dir;
-use yomichan_rs;
-use yomichan_rs::parking_lot;
+use std::path::PathBuf;
+use std::sync::{Arc, LazyLock, RwLock};
 use yomichan_rs::Yomichan;
 
-static YCD: LazyLock<parking_lot::RwLock<Yomichan>> = LazyLock::new(|| {
-    let ycd = parking_lot::RwLock::new(Yomichan::new(data_dir().unwrap()).unwrap());
-    ycd.write().set_language("es").unwrap();
-    ycd.write().update_options().unwrap();
-    ycd
-});
+// --- 1. GLOBAL STATE MANAGER ---
+// Single source of truth for the dictionary backend.
+static YOMICHAN_GLOBAL: LazyLock<Arc<RwLock<Option<Yomichan>>>> = LazyLock::new(|| {
+    let user_path = godot::classes::Os::singleton()
+        .get_user_data_dir()
+        .to_string();
+    let path = PathBuf::from(user_path);
 
-#[derive(Clone)]
-struct AppPaths {
-    data: PathBuf,
-    log: PathBuf,
-}
-impl Default for AppPaths {
-    fn default() -> Self {
-        let data = data_dir().expect("could not get data dir");
-        Self {
-            log: data.clone().join("log"),
-            data,
+    godot_print!("Initializing Yomichan at: {:?}", path);
+
+    match Yomichan::new(path.clone()) {
+        Ok(mut y) => {
+            // Default config
+            let _ = y.set_language("es");
+            let _ = y.update_options();
+            Arc::new(RwLock::new(Some(y)))
+        }
+        Err(e) => {
+            godot_warn!("Yomichan init failed (ignore if first run): {}", e);
+            Arc::new(RwLock::new(None))
         }
     }
-}
+});
 
-#[derive(Clone, Default)]
-struct AppData {
-    paths: AppPaths,
-}
+struct ProairGame;
+#[gdextension]
+unsafe impl ExtensionLibrary for ProairGame {}
 
+// --- 2. SCREEN 1: SEARCH ---
 #[derive(GodotClass)]
-#[class(base=Control, init)]
-pub struct SearchState {
-    #[export_group(name = "Search")]
+#[class(base=Control)]
+pub struct SearchScreen {
     #[export]
-    search_input: Option<Gd<LineEdit>>,
+    input: Option<Gd<LineEdit>>,
     #[export]
-    search_results: Option<Gd<VBoxContainer>>,
+    results_container: Option<Gd<VBoxContainer>>,
     #[base]
     base: Base<Control>,
 }
 
 #[godot_api]
-impl IControl for SearchState {
-    fn ready(&mut self) {
-        let on_submit = &self.base().callable("search");
-        let Some(input) = &mut self.search_input else {
-            panic!("missing search input reference");
-        };
-        let res = input.connect("text_submitted", on_submit);
-        if res != godot::global::Error::OK {
-            panic!("{res:?}");
+impl IControl for SearchScreen {
+    fn init(base: Base<Control>) -> Self {
+        Self {
+            input: None,
+            results_container: None,
+            base,
         }
     }
 
-    fn unhandled_input(&mut self, event: Gd<InputEvent>) {
-        if event.is_action_pressed("ui_cancel") {
-            if let Some(input) = &mut self.search_input {
-                input.grab_focus();
-                input.select_all();
+    fn ready(&mut self) {
+        // Auto-connect text_submitted signal
+        if let Some(input) = &mut self.input {
+            let callback = self.base().callable("perform_search");
+            if !input.is_connected("text_submitted", &callback) {
+                input.connect("text_submitted", &callback);
             }
         }
     }
 }
 
 #[godot_api]
-impl SearchState {
+impl SearchScreen {
     #[func]
-    fn search(&mut self, text: GString) {
-        let Some(results) = &mut self.search_results else {
-            panic!("search_results is None!");
+    fn perform_search(&mut self, text: GString) {
+        let Some(container) = &mut self.results_container else {
+            return;
         };
-        let mut label = Label::new_alloc();
-        let mut def = Label::new_alloc();
-        label.set_text(&format!("You searched for: '{text}'"));
-        def.set_text(&format!("{:?}", YCD.write().search(&text.to_string())));
-        results.add_child(&label);
+
+        // Clear previous results
+        for mut child in container.get_children().iter_shared() {
+            child.queue_free();
+        }
+
+        // Access Global State
+        let mut lock = YOMICHAN_GLOBAL.write().unwrap();
+
+        if let Some(yomichan) = lock.as_mut() {
+            let results = yomichan.search(&text.to_string());
+
+            // Render results
+            let mut label = RichTextLabel::new_alloc();
+            label.set_text(&format!("{:#?}", results)); // Debug view
+            label.set_fit_content(true);
+            container.add_child(&label);
+        } else {
+            let mut label = Label::new_alloc();
+            label.set_text("Dictionary backend not loaded. Check 'Dictionaries' tab.");
+            container.add_child(&label);
+        }
+    }
+}
+
+// --- 3. SCREEN 2: DICTIONARIES ---
+#[derive(GodotClass)]
+#[class(base=Control)]
+pub struct DictionariesScreen {
+    #[export]
+    status_label: Option<Gd<Label>>,
+    #[export] // <--- LINK THIS IN GODOT
+    file_dialog: Option<Gd<FileDialog>>,
+    #[base]
+    base: Base<Control>,
+}
+
+#[godot_api]
+impl IControl for DictionariesScreen {
+    fn init(base: Base<Control>) -> Self {
+        Self {
+            status_label: None,
+            file_dialog: None,
+            base,
+        }
+    }
+
+    fn ready(&mut self) {
+        self.refresh_status();
+
+        // Connect the file dialog "dir_selected" signal
+        if let Some(fd) = &mut self.file_dialog {
+            let on_dir_selected = self.base().callable("on_file_dialog_selected");
+            if !fd.is_connected("dir_selected", &on_dir_selected) {
+                 fd.connect("dir_selected", &on_dir_selected);
+            }
+        }
+    }
+}
+
+#[godot_api]
+impl DictionariesScreen {
+    #[func]
+    fn refresh_status(&mut self) {
+        let Some(label) = &mut self.status_label else {
+            return;
+        };
+
+        let lock = YOMICHAN_GLOBAL.read().unwrap();
+        if let Some(y) = lock.as_ref() {
+            let count = y.dictionary_summaries().map(|s| s.len()).unwrap_or(0);
+            label.set_text(&format!("Status: Active\nDictionaries Loaded: {}", count));
+        } else {
+            label.set_text("Status: Not Initialized (Files missing?)");
+        }
+    }
+
+    // Called by the "Add Dictionary" Button
+    #[func]
+    fn on_add_btn_pressed(&mut self) {
+        if let Some(fd) = &mut self.file_dialog {
+            fd.popup_centered();
+        } else {
+            godot_error!("FileDialog not linked in Inspector!");
+        }
+    }
+
+    // Called when the user picks a folder
+    #[func]
+    fn on_file_dialog_selected(&mut self, path: GString) {
+        let path_str = path.to_string();
+        godot_print!("Importing dictionary from: {}", path_str);
+
+        let mut lock = YOMICHAN_GLOBAL.write().unwrap();
+
+        // If backend isn't loaded, try to load/create it
+        if lock.is_none() {
+            let user_path = PathBuf::from(
+                godot::classes::Os::singleton()
+                    .get_user_data_dir()
+                    .to_string(),
+            );
+            *lock = Yomichan::new(user_path).ok();
+        }
+
+        if let Some(y) = lock.as_mut() {
+            match y.import_dictionaries(&[&path_str]) {
+                Ok(_) => godot_print!("Import Success!"),
+                Err(e) => godot_warn!("Import Failed: {}", e),
+            }
+        }
+        
+        drop(lock); // Release lock before UI update
+        self.refresh_status();
+    }
+}
+
+// --- 4. SCREEN 3: SETTINGS ---
+#[derive(GodotClass)]
+#[class(base=Control)]
+pub struct SettingsScreen {
+    #[base]
+    base: Base<Control>,
+}
+
+#[godot_api]
+impl IControl for SettingsScreen {
+    fn init(base: Base<Control>) -> Self {
+        Self { base }
+    }
+}
+
+#[godot_api]
+impl SettingsScreen {
+    #[func]
+    fn set_lang_es(&mut self) {
+        self.change_lang("es");
+    }
+
+    #[func]
+    fn set_lang_en(&mut self) {
+        self.change_lang("en");
+    }
+
+    fn change_lang(&self, lang_code: &str) {
+        let mut lock = YOMICHAN_GLOBAL.write().unwrap();
+        if let Some(y) = lock.as_mut() {
+            let _ = y.set_language(lang_code);
+            let _ = y.update_options();
+            godot_print!("Language changed to: {}", lang_code);
+        }
     }
 }
