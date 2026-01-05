@@ -1,3 +1,5 @@
+//! extensions.rs
+
 use godot::obj::Gd;
 
 trait InternalExtGodot {

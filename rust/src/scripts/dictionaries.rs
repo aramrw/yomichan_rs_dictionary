@@ -1,12 +1,9 @@
-use godot::classes::{
-    Control, IControl, Label, LineEdit, OptionButton, RichTextLabel, VBoxContainer,
-};
+use crate::YOMICHAN_GLOBAL;
+use godot::classes::Os;
+use godot::classes::{Control, FileDialog, IControl, Label};
 use godot::prelude::*;
 use std::path::PathBuf;
-//use std::sync::{Arc, LazyLock, RwLock};
 use yomichan_rs::Yomichan;
-
-use crate::YOMICHAN_GLOBAL;
 
 #[derive(GodotClass)]
 #[class(base=Control)]
@@ -14,7 +11,7 @@ pub struct DictionariesScreen {
     #[export]
     status_label: Option<Gd<Label>>,
     #[export]
-    import_path_input: Option<Gd<LineEdit>>,
+    file_dialog: Option<Gd<FileDialog>>,
     #[base]
     base: Base<Control>,
 }
@@ -24,13 +21,19 @@ impl IControl for DictionariesScreen {
     fn init(base: Base<Control>) -> Self {
         Self {
             status_label: None,
-            import_path_input: None,
+            file_dialog: None,
             base,
         }
     }
 
     fn ready(&mut self) {
         self.refresh_status();
+        let on_dir_selected = self.base().callable("on_file_dialog_selected");
+        if let Some(fd) = &mut self.file_dialog {
+            if !fd.is_connected("dir_selected", &on_dir_selected) {
+                fd.connect("dir_selected", &on_dir_selected);
+            }
+        }
     }
 }
 
@@ -44,50 +47,48 @@ impl DictionariesScreen {
 
         let lock = YOMICHAN_GLOBAL.read();
         if let Some(y) = lock.as_ref() {
-            let count = y.dictionary_summaries().map(|s| s.len()).unwrap_or(0);
-            label.set_text(&format!("Status: Active\nDictionaries Loaded: {}", count));
+            let cp = y.options().read().get_current_profile().unwrap();
+            let mut cp = cp.write();
+            let dicts = cp.dictionaries_mut();
+            let dicts_len = dicts.len();
+            for dict in dicts {
+                dict.1.enabled = true;
+            }
+            label.set_text(&format!("Status: Active\nDictionaries Loaded: {dicts_len}"));
         } else {
             label.set_text("Status: Not Initialized (Files missing?)");
         }
     }
 
     #[func]
-    fn on_import_pressed(&mut self) {
-        let path_str = self
-            .import_path_input
-            .as_ref()
-            .map(|i| i.get_text().to_string())
-            .unwrap_or_default();
+    fn on_add_btn_pressed(&mut self) {
+        if let Some(fd) = &mut self.file_dialog {
+            fd.popup_centered();
+        } else {
+            godot_error!("FileDialog not linked in Inspector!");
+        }
+    }
 
-        if path_str.is_empty() {
-            godot_print!("No path provided");
-            return;
+    #[func]
+    fn on_file_dialog_selected(&mut self, path: GString) {
+        let path_str = path.to_string();
+        godot_print!("Importing dictionary from: {}", path_str);
+
+        let mut lock = YOMICHAN_GLOBAL.write();
+
+        // Lazy init if null
+        if lock.is_none() {
+            let user_path = PathBuf::from(Os::singleton().get_user_data_dir().to_string());
+            *lock = Yomichan::new(user_path).ok();
         }
 
-        // This requires write access to the global state
-        let mut ycd = YOMICHAN_GLOBAL.write();
-
-        // If yomichan is None, try to re-init it first or create new
-        if ycd.is_none() {
-            let user_path = PathBuf::from(
-                godot::classes::Os::singleton()
-                    .get_user_data_dir()
-                    .to_string(),
-            );
-            *ycd = Yomichan::new(user_path).ok();
+        if let Some(y) = lock.as_mut() {
+            match y.import_dictionaries(&[&path_str]) {
+                Ok(_) => godot_print!("Import Success!"),
+                Err(e) => godot_warn!("Import Failed: {}", e),
+            }
         }
-
-        let Some(ycd) = ycd.take() else {
-            return;
-        };
-
-        match ycd.import_dictionaries(&[&path_str]) {
-            Ok(_) => godot_print!("Import Success!"),
-            Err(e) => godot_warn!("Import Failed: {}", e),
-        }
-
-        // Drop lock before refreshing UI to avoid deadlocks
-        drop(ycd);
+        drop(lock);
         self.refresh_status();
     }
 }
